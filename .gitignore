@@ -1,0 +1,7 @@
+# Created by .ignore support plugin (hsz.mobi)
+/receiver/creds/
+/receiver/build_and_copy.sh
+
+receiver/my-data-dir/
+
+receiver/weather
