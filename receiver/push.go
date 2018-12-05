@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"firebase.google.com/go"
 	"firebase.google.com/go/messaging"
+	"fmt"
+	"github.com/go-redis/redis"
 	"github.com/gobuffalo/packr"
-	"github.com/peterbourgon/diskv"
 	"github.com/satori/go.uuid"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
@@ -30,25 +31,20 @@ var FirebaseScopes = []string{
 const (
 	boxFolder    = "./creds"
 	htmlTemplate = "push.creds"
+	tokenPrefix  = "token:"
+	tokenPattern = tokenPrefix + "*"
 )
 
 type Server struct {
 	client   *messaging.Client
-	db       *diskv.Diskv
+	db       *redis.Client
 	quitChan chan time.Time
 }
 
-func NewPushServer(port string) (*Server, error) {
-	// Simplest transform function: put all the data files into the base dir.
-	flatTransform := func(s string) []string { return []string{} }
-
-	// Initialize a new diskv store, rooted at "my-data-dir", with a 1MB cache.
-	d := diskv.New(diskv.Options{
-		BasePath:     "token_dir",
-		Transform:    flatTransform,
-		CacheSizeMax: 1024 * 1024,
+func NewPushServer(port, redisHost string) (*Server, error) {
+	db := redis.NewClient(&redis.Options{
+		Addr: redisHost,
 	})
-
 	// html template folder
 	tmpBox := packr.NewBox(boxFolder)
 
@@ -65,7 +61,7 @@ func NewPushServer(port string) (*Server, error) {
 
 	s := &Server{
 		client:   client,
-		db:       d,
+		db:       db,
 		quitChan: make(chan time.Time, 0),
 	}
 	go s.startCancel()
@@ -103,9 +99,13 @@ func (s *Server) AddToken(body io.Reader) error {
 	if err != nil {
 		return nil
 	}
+	keys, err := s.db.Keys(tokenPattern).Result()
+	if err != nil {
+		return nil
+	}
 
-	for key := range s.db.Keys(nil) {
-		savedToken, err := s.db.Read(key)
+	for _, key := range keys {
+		savedToken, err := s.db.Get(key).Result()
 		if err != nil {
 			log.Println(err)
 			continue
@@ -115,8 +115,8 @@ func (s *Server) AddToken(body io.Reader) error {
 			return nil
 		}
 	}
-	s.db.Write(uuid.NewV4().String(), []byte(tr.Token))
-	log.Printf("Token %v registerd\n", tr.Token)
+	err = s.db.Set(fmt.Sprintf("%v%v", tokenPrefix, uuid.NewV4().String()), []byte(tr.Token), 0).Err()
+	log.Printf("Token %v registerd with err: %v\n", tr.Token, err)
 	return nil
 }
 
@@ -125,8 +125,14 @@ func (s *Server) SendPushes(delete string) {
 		s.sending()
 	}
 
-	for key := range s.db.Keys(nil) {
-		token, err := s.db.Read(key)
+	keys, err := s.db.Keys(tokenPattern).Result()
+	if err != nil {
+		log.Println("Error getting keys", err)
+		return
+	}
+
+	for _, key := range keys {
+		token, err := s.db.Get(key).Result()
 		if err != nil {
 			log.Println(err)
 			continue
@@ -156,13 +162,14 @@ func (s *Server) SendPushes(delete string) {
 		response, err := s.client.Send(context.Background(), message)
 		if err != nil {
 			log.Println("Error sending", err)
-			s.db.Erase(key)
+			s.db.Del(key)
 			continue
 		}
 		// Response is a message ID string.
 		log.Println("Delete:", delete, "Successfully sent message:", response)
 	}
 }
+
 func (s *Server) sending() {
 	s.quitChan <- time.Now().Add(time.Minute * 2)
 }

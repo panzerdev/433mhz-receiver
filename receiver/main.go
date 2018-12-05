@@ -17,6 +17,7 @@ var (
 	listenAddr = kingpin.Flag("listen-address", "The address to listen on for HTTP requests.").
 			Default(":8080").String()
 	ids = kingpin.Arg("ids", "Sensor IDs that will be exported").StringMap()
+	redisAddr = kingpin.Flag("redis", "Sensor IDs that will be exported").Default("192.168.2.22:6379").String()
 
 	temperature     *prometheus.GaugeVec
 	humidity        *prometheus.GaugeVec
@@ -108,7 +109,7 @@ func main() {
 		}).Inc()
 	})
 
-	server, err := NewPushServer("8081")
+	server, err := NewPushServer("8081", *redisAddr)
 	if err != nil {
 		log.Fatalln(err)
 	}
