@@ -173,9 +173,24 @@ type GTWT01Result struct {
 	LowBattery  bool
 }
 
+func (d GTWT01Result) ReasonableData() bool {
+	return ValidateTempHumid(d.Temperature, d.Humidity)
+}
+
 type GrubeData struct {
 	dist           int
 	temp, humidity float64
 	Name           string
 	ID             string
+}
+
+func ValidateTempHumid(temp float64, humid int) bool {
+	if temp > 60 || temp < -50 {
+		return false
+	}
+
+	if humid > 100 || humid < 0 {
+		return false
+	}
+	return true
 }

@@ -1,14 +1,17 @@
 package main
 
 import (
-	"encoding/json"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"gopkg.in/alecthomas/kingpin.v2"
-	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"strings"
+
+	"github.com/panzerdev/grpc-impl/sensors/sensor"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 var (
@@ -16,7 +19,10 @@ var (
 		Default("/dev/ttyUSB0").String()
 	listenAddr = kingpin.Flag("listen-address", "The address to listen on for HTTP requests.").
 			Default(":8080").String()
-	ids = kingpin.Arg("ids", "Sensor IDs that will be exported").StringMap()
+
+	grpcListenAddr = kingpin.Flag("grpc-listen-address", "The address to listen on for HTTP requests.").
+			Default(":8082").String()
+	ids       = kingpin.Arg("ids", "Sensor IDs that will be exported").StringMap()
 	redisAddr = kingpin.Flag("redis", "Sensor IDs that will be exported").Default("192.168.2.22:6379").String()
 
 	temperature     *prometheus.GaugeVec
@@ -32,11 +38,37 @@ const (
 	SensorLocation = "location"
 )
 
-type RemoteSensor struct {
-	Id          string  `json:"id"`
-	Location    string  `json:"location"`
-	Temperature float64 `json:"temperature"`
-	Humidity    float64 `json:"humidity"`
+type SensorServer struct {
+}
+
+func (s *SensorServer) StreamReadings(stream sensor.SensorReportingService_StreamReadingsServer) error {
+	for {
+		data, err := stream.Recv()
+		if err != nil {
+			log.Println(err)
+			return err
+		}
+
+		if !ValidateTempHumid(float64(data.Dht22.Temperature), int(data.Dht22.Humidity)) {
+			log.Printf("Sensor has unreasonable data %+v\n", data)
+			continue
+		}
+
+		temperature.With(prometheus.Labels{
+			SensorID:       data.Id,
+			SensorLocation: data.Location,
+		}).Set(float64(data.Dht22.Temperature))
+
+		humidity.With(prometheus.Labels{
+			SensorID:       data.Id,
+			SensorLocation: data.Location,
+		}).Set(float64(data.Dht22.Humidity))
+
+		locationCount.With(prometheus.Labels{
+			SensorID:       data.Id,
+			SensorLocation: data.Location,
+		}).Inc()
+	}
 }
 
 func main() {
@@ -78,36 +110,6 @@ func main() {
 	prometheus.MustRegister(distance)
 
 	http.Handle("/metrics", promhttp.Handler())
-	http.HandleFunc("/remote_sensors", func(writer http.ResponseWriter, request *http.Request) {
-		body, err := ioutil.ReadAll(request.Body)
-		if err != nil {
-			log.Println("Reading request body", err)
-			writer.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		var data RemoteSensor
-		err = json.Unmarshal(body, &data)
-		if err != nil {
-			log.Println("Unmarshal Json", err)
-			writer.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		temperature.With(prometheus.Labels{
-			SensorID:       data.Id,
-			SensorLocation: data.Location,
-		}).Set(data.Temperature)
-
-		humidity.With(prometheus.Labels{
-			SensorID:       data.Id,
-			SensorLocation: data.Location,
-		}).Set(data.Humidity)
-
-		locationCount.With(prometheus.Labels{
-			SensorID:       data.Id,
-			SensorLocation: data.Location,
-		}).Inc()
-	})
 
 	server, err := NewPushServer("8081", *redisAddr)
 	if err != nil {
@@ -122,6 +124,20 @@ func main() {
 	defer dev.Close()
 
 	go receive(dev)
+
+	gServer := grpc.NewServer()
+	sensor.RegisterSensorReportingServiceServer(gServer, &SensorServer{})
+	reflection.Register(gServer)
+
+	listener, err := net.Listen("tcp", *grpcListenAddr)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	defer listener.Close()
+
+	go func() {
+		log.Fatalln(gServer.Serve(listener))
+	}()
 
 	log.Printf("Serving metrics at '%v/metrics'", *listenAddr)
 	log.Fatal(http.ListenAndServe(*listenAddr, nil))
@@ -156,6 +172,11 @@ func DecodeSignal(line string) {
 		log.Printf("%v: %+v\n", device, *m)
 		if loc, ok := sensorLocations[m.Name]; !ok || loc == "" {
 			log.Println("Sensor hasn't set a location and won't be provided to Prometheus for monitoring")
+			return
+		}
+
+		if !m.ReasonableData() {
+			log.Printf("Sensor has unreasonable data %+v\n", m)
 			return
 		}
 
